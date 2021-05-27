@@ -1,0 +1,11 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+       - aws s3 cp s3://${bucket_name}/task_def.json .
+       - aws s3 cp s3://${bucket_name}/appspec.yml .
+artifacts:
+  files:
+    - task_def.json
+    - appspec.yml

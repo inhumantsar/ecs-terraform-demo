@@ -1,0 +1,137 @@
+
+on:
+  push:
+    branches:
+      - 'master'
+      - 'develop'
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+  pull-request:
+    branches:
+      - 'master'
+      - 'develop'
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+
+env:
+  APPNAME: fakeproject
+  AWS_DEFAULT_REGION: ca-central-1
+
+jobs:
+  test:
+    steps:
+      - name: Pretend to do some testing
+        run: echo "Testing.....OK!"
+
+  build:
+    needs: test
+    if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop') && github.event_name == 'push'
+    steps:
+      - name: Set required vars
+        run: |
+          # ecr repo, reading in account ID
+          echo "ecr_repo=$(aws sts get-caller-identity --query Account --output text).dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/$APPNAME" >> $GITHUB_ENV
+          # environment/docker_tag based on branch name
+          [[ "${GITHUB_REF##*/}" == "develop" ]] && echo "docker_tag=latest" >> $GITHUB_ENV
+          [[ "${GITHUB_REF##*/}" == "master" ]] && echo "docker_tag=stable" >> $GITHUB_ENV
+        env:
+          - AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          - AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+      - name: Build Docker image
+        run: docker build -t ${{ env.ecr_repo }}:${{ env.docker_tag }} src/
+
+      - name: Perform smoke test
+        run: echo "We'll just pretend this does something for now..."
+
+    terraform:
+      needs: test
+      steps:
+        - name: Checkout
+          uses: actions/checkout@v2
+
+        - name: Setup Terraform
+          uses: hashicorp/setup-terraform@v1
+
+        - name: Terraform Format
+          id: fmt
+          run: terraform fmt -check
+
+        - name: Terraform Init
+          id: init
+          run: terraform init
+          env:
+            - AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            - AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+        # only applicable to PRs
+        - name: Terraform Plan
+          id: plan
+          if: github.event_name == 'pull_request'
+          run: terraform plan -var="environment=${{ env.docker_tag }}" -no-color
+          continue-on-error: true
+          env:
+            - AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            - AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+        - name: Update Pull Request
+          uses: actions/github-script@0.9.0
+          if: github.event_name == 'pull_request'
+          env:
+            PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+          with:
+            github-token: ${{ secrets.GITHUB_TOKEN }}
+            script: |
+              const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+              #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+              #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+              <details><summary>Show Plan</summary>
+              \`\`\`${process.env.PLAN}\`\`\`
+              </details>
+              *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+              github.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output
+              })
+
+          # exit with an error if plan step above failed.
+          - name: Terraform Plan Status
+            if: steps.plan.outcome == 'failure'
+            run: exit 1
+
+          # only applicable on pushes
+          - name: Terraform Apply
+            if: (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop') && github.event_name == 'push'
+            run: terraform apply -var="environment=${{ env.docker_tag }}" -auto-approve
+            env:
+              - AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+              - AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    deploy:
+      needs: [build, terraform]
+      steps:
+        - name: Write appspec and task def files to local
+          run: |
+            export $(xargs <deploy/tf.env)
+            j2 deploy/codebuild/task_def.json.j2 > deploy/codebuild/task_def.json --undefined
+            j2 deploy/codebuild/appspec.yml.j2 > deploy/codebuild/appspec.yaml --undefined
+
+        - name: Upload appspec and task def files to s3
+          run: |
+            export $(xargs <deploy/tf.env)
+            aws s3 cp task_def.json s3://$artifact_bucket/task_def.json
+            aws s3 cp appspec.yml s3://$artifact_bucket/appspec.yml
+
+        - name: Push Docker image
+          run: |
+            aws ecr get-login --no-include-email --region
+            docker push ${{ env.ecr_repo }}:${{ env.docker_tag }}
+          env:
+            - AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+            - AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+

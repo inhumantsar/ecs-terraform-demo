@@ -1,0 +1,9 @@
+FROM tiangolo/uwsgi-nginx-flask:python3.6
+ENV STATIC_INDEX 1
+ADD requirements.txt /
+RUN pip3 install -r /requirements.txt
+ARG APP_NAME
+ENV APP_NAME=$APP_NAME
+COPY ./app /app
+WORKDIR /app
+ENTRYPOINT [ "python3", "main.py"]
